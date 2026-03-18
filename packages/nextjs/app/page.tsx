@@ -4,7 +4,9 @@ import { useEffect, useState } from "react";
 import { Address } from "@scaffold-ui/components";
 import type { NextPage } from "next";
 import { formatEther, parseEther } from "viem";
-import { useAccount } from "wagmi";
+import { base } from "viem/chains";
+import { useAccount, useSwitchChain } from "wagmi";
+import { RainbowKitCustomConnectButton } from "~~/components/scaffold-eth/RainbowKitCustomConnectButton";
 import { useScaffoldReadContract, useScaffoldWriteContract } from "~~/hooks/scaffold-eth";
 import { useDeployedContractInfo } from "~~/hooks/scaffold-eth";
 
@@ -18,15 +20,22 @@ const LOCK_TIERS = [
 const CLAWD_TOKEN = "0x9f86dB9fc6f7c9408e8Fda3Ff8ce4e78ac7a6b07";
 
 const Home: NextPage = () => {
-  const { address, isConnected } = useAccount();
+  const { address, isConnected, chain } = useAccount();
+  const { switchChain, isPending: isSwitching } = useSwitchChain();
 
   const [depositAmount, setDepositAmount] = useState("");
   const [withdrawAmount, setWithdrawAmount] = useState("");
   const [selectedTier, setSelectedTier] = useState(0);
   const [isDepositing, setIsDepositing] = useState(false);
   const [isWithdrawing, setIsWithdrawing] = useState(false);
+  const [isApproving, setIsApproving] = useState(false);
+  const [approveCooldown, setApproveCooldown] = useState(false);
   const [isCompounding, setIsCompounding] = useState(false);
   const [clawdPrice, setClawdPrice] = useState<number>(0);
+
+  // Target chain - Base for production, foundry for dev
+  const targetChainId = chain?.id === 31337 ? 31337 : base.id;
+  const wrongNetwork = isConnected && chain?.id !== targetChainId;
 
   // Fetch CLAWD price from DexScreener
   useEffect(() => {
@@ -37,7 +46,9 @@ const Home: NextPage = () => {
         if (data.pairs?.[0]?.priceUsd) {
           setClawdPrice(parseFloat(data.pairs[0].priceUsd));
         }
-      } catch {}
+      } catch {
+        /* price fetch is best-effort */
+      }
     };
     fetchPrice();
     const interval = setInterval(fetchPrice, 30000);
@@ -81,8 +92,47 @@ const Home: NextPage = () => {
     watch: true,
   });
 
+  // Read CLAWD allowance for vault
+  const { data: clawdAllowance } = useScaffoldReadContract({
+    contractName: "CLAWDToken",
+    functionName: "allowance",
+    args: [address, vaultAddress],
+    watch: true,
+  });
+
+  // Read CLAWD balance
+  const { data: clawdBalance } = useScaffoldReadContract({
+    contractName: "CLAWDToken",
+    functionName: "balanceOf",
+    args: [address],
+    watch: true,
+  });
+
   // Write contracts
   const { writeContractAsync: vaultWrite } = useScaffoldWriteContract("CLAWDVault");
+  const { writeContractAsync: tokenWrite } = useScaffoldWriteContract("CLAWDToken");
+
+  const depositAmountWei = depositAmount ? parseEther(depositAmount) : 0n;
+  const needsApproval = !clawdAllowance || clawdAllowance < depositAmountWei;
+
+  const handleApprove = async () => {
+    if (!depositAmount || parseFloat(depositAmount) <= 0 || !vaultAddress) return;
+    setIsApproving(true);
+    try {
+      // Approve 3x the amount for convenience
+      const approveAmount = depositAmountWei * 3n;
+      await tokenWrite({
+        functionName: "approve",
+        args: [vaultAddress, approveAmount],
+      });
+      setApproveCooldown(true);
+      setTimeout(() => setApproveCooldown(false), 4000);
+    } catch (e) {
+      console.error("Approve failed:", e);
+    } finally {
+      setIsApproving(false);
+    }
+  };
 
   const handleDeposit = async () => {
     if (!depositAmount || parseFloat(depositAmount) <= 0) return;
@@ -93,7 +143,7 @@ const Home: NextPage = () => {
         args: [parseEther(depositAmount), selectedTier],
       });
       setDepositAmount("");
-    } catch (e: any) {
+    } catch (e) {
       console.error("Deposit failed:", e);
     } finally {
       setIsDepositing(false);
@@ -109,7 +159,7 @@ const Home: NextPage = () => {
         args: [parseEther(withdrawAmount)],
       });
       setWithdrawAmount("");
-    } catch (e: any) {
+    } catch (e) {
       console.error("Withdraw failed:", e);
     } finally {
       setIsWithdrawing(false);
@@ -120,7 +170,7 @@ const Home: NextPage = () => {
     setIsCompounding(true);
     try {
       await vaultWrite({ functionName: "compound" });
-    } catch (e: any) {
+    } catch (e) {
       console.error("Compound failed:", e);
     } finally {
       setIsCompounding(false);
@@ -132,10 +182,105 @@ const Home: NextPage = () => {
   const userShares = stClawdBalance ? formatEther(stClawdBalance) : "0";
   const userUnderlying = underlyingBal ? formatEther(underlyingBal) : "0";
   const userUnderlyingUsd = clawdPrice > 0 ? `~$${(parseFloat(userUnderlying) * clawdPrice).toFixed(2)}` : "";
+  const userClawdBal = clawdBalance ? formatEther(clawdBalance) : "0";
+  const userClawdBalUsd = clawdPrice > 0 ? `~$${(parseFloat(userClawdBal) * clawdPrice).toFixed(2)}` : "";
 
   const lockExpiry = userDeposit ? Number(userDeposit[1]) : 0;
   const lockTier = userDeposit ? Number(userDeposit[2]) : 0;
   const isLocked = lockExpiry > Math.floor(Date.now() / 1000);
+
+  // Four-state deposit button
+  const renderDepositButton = () => {
+    if (!isConnected) {
+      return <RainbowKitCustomConnectButton />;
+    }
+    if (wrongNetwork) {
+      return (
+        <button
+          className="btn btn-warning w-full"
+          onClick={() => switchChain({ chainId: base.id })}
+          disabled={isSwitching}
+        >
+          {isSwitching ? (
+            <>
+              <span className="loading loading-spinner loading-sm" /> Switching...
+            </>
+          ) : (
+            "Switch to Base"
+          )}
+        </button>
+      );
+    }
+    if (needsApproval && depositAmount && parseFloat(depositAmount) > 0) {
+      return (
+        <button className="btn btn-primary w-full" onClick={handleApprove} disabled={isApproving || approveCooldown}>
+          {isApproving || approveCooldown ? (
+            <>
+              <span className="loading loading-spinner loading-sm" /> Approving...
+            </>
+          ) : (
+            "Approve CLAWD"
+          )}
+        </button>
+      );
+    }
+    return (
+      <button
+        className="btn btn-primary w-full"
+        onClick={handleDeposit}
+        disabled={isDepositing || !depositAmount || parseFloat(depositAmount) <= 0}
+      >
+        {isDepositing ? (
+          <>
+            <span className="loading loading-spinner loading-sm" /> Depositing...
+          </>
+        ) : (
+          "Deposit"
+        )}
+      </button>
+    );
+  };
+
+  // Four-state withdraw button
+  const renderWithdrawButton = () => {
+    if (!isConnected) {
+      return <RainbowKitCustomConnectButton />;
+    }
+    if (wrongNetwork) {
+      return (
+        <button
+          className="btn btn-warning w-full"
+          onClick={() => switchChain({ chainId: base.id })}
+          disabled={isSwitching}
+        >
+          {isSwitching ? (
+            <>
+              <span className="loading loading-spinner loading-sm" /> Switching...
+            </>
+          ) : (
+            "Switch to Base"
+          )}
+        </button>
+      );
+    }
+    return (
+      <button
+        className="btn btn-secondary w-full"
+        onClick={handleWithdraw}
+        disabled={isWithdrawing || !withdrawAmount || parseFloat(withdrawAmount) <= 0 || isLocked}
+      >
+        {isWithdrawing ? (
+          <>
+            <span className="loading loading-spinner loading-sm" /> Withdrawing...
+          </>
+        ) : isLocked ? (
+          "Locked"
+        ) : (
+          "Withdraw"
+        )}
+      </button>
+    );
+  };
 
   return (
     <div className="flex flex-col items-center gap-6 p-4 md:p-8 bg-base-200 min-h-screen">
@@ -170,7 +315,12 @@ const Home: NextPage = () => {
         <div className="card bg-base-100 shadow-md w-full max-w-4xl">
           <div className="card-body">
             <h2 className="card-title">Your Position</h2>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+              <div>
+                <p className="text-sm opacity-70">CLAWD Balance</p>
+                <p className="text-xl font-bold">{parseFloat(userClawdBal).toLocaleString()}</p>
+                {userClawdBalUsd && <p className="text-sm opacity-60">{userClawdBalUsd}</p>}
+              </div>
               <div>
                 <p className="text-sm opacity-70">stCLAWD Balance</p>
                 <p className="text-xl font-bold">{parseFloat(userShares).toLocaleString()}</p>
@@ -212,7 +362,7 @@ const Home: NextPage = () => {
                 className="input input-bordered w-full"
                 value={depositAmount}
                 onChange={e => setDepositAmount(e.target.value)}
-                disabled={isDepositing}
+                disabled={isDepositing || isApproving}
               />
               {depositAmount && clawdPrice > 0 && (
                 <p className="text-sm opacity-60 mt-1">
@@ -236,30 +386,7 @@ const Home: NextPage = () => {
                 ))}
               </select>
             </div>
-            <div className="card-actions mt-4">
-              {!isConnected ? (
-                <button className="btn btn-primary w-full" disabled>
-                  Connect Wallet
-                </button>
-              ) : (
-                <button
-                  className="btn btn-primary w-full"
-                  onClick={handleDeposit}
-                  disabled={isDepositing || !depositAmount || parseFloat(depositAmount) <= 0}
-                >
-                  {isDepositing ? (
-                    <>
-                      <span className="loading loading-spinner loading-sm" /> Depositing...
-                    </>
-                  ) : (
-                    "Deposit"
-                  )}
-                </button>
-              )}
-            </div>
-            <p className="text-xs opacity-50 mt-1">
-              Note: You must first approve CLAWD spending on the token contract.
-            </p>
+            <div className="card-actions mt-4">{renderDepositButton()}</div>
           </div>
         </div>
 
@@ -291,29 +418,7 @@ const Home: NextPage = () => {
                 Max
               </button>
             </div>
-            <div className="card-actions mt-4">
-              {!isConnected ? (
-                <button className="btn btn-secondary w-full" disabled>
-                  Connect Wallet
-                </button>
-              ) : (
-                <button
-                  className="btn btn-secondary w-full"
-                  onClick={handleWithdraw}
-                  disabled={isWithdrawing || !withdrawAmount || parseFloat(withdrawAmount) <= 0 || isLocked}
-                >
-                  {isWithdrawing ? (
-                    <>
-                      <span className="loading loading-spinner loading-sm" /> Withdrawing...
-                    </>
-                  ) : isLocked ? (
-                    "Locked"
-                  ) : (
-                    "Withdraw"
-                  )}
-                </button>
-              )}
-            </div>
+            <div className="card-actions mt-4">{renderWithdrawButton()}</div>
           </div>
         </div>
       </div>
